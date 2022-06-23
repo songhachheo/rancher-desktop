@@ -4,6 +4,7 @@ import http from 'http';
 import path from 'path';
 import stream from 'stream';
 import { URL } from 'url';
+import _ from 'lodash';
 
 import Logging from '@/utils/logging';
 import paths from '@/utils/paths';
@@ -25,6 +26,11 @@ const SERVER_PORT = 6109;
 const SERVER_USERNAME = 'user';
 const SERVER_FILE_BASENAME = 'credential-server.json';
 const MAX_REQUEST_BODY_LENGTH = 2048;
+
+type credHelperInfo = {
+  credsStore: string;
+  credHelpers: Record<string, string>
+};
 
 export function getServerCredentialsPath(): string {
   return path.join(paths.appHome, SERVER_FILE_BASENAME);
@@ -85,7 +91,6 @@ export class HttpCredentialHelperServer {
 
         return;
       }
-      const helperName = `docker-credential-${ await this.getCredentialHelperName() }`;
       const method = request.method ?? 'POST';
       const url = new URL(request.url ?? '', `http://${ request.headers.host }`);
       const path = url.pathname;
@@ -103,8 +108,16 @@ export class HttpCredentialHelperServer {
       if (pathParts.shift()) {
         response.writeHead(400, { 'Content-Type': 'text/plain' });
         response.write(`Unexpected data before first / in URL ${ path }`);
+
+        return;
+      }
+      const commandName = pathParts[0];
+      const helperInfo = await this.getCredentialHelperName(commandName, data);
+
+      if (commandName === 'list') {
+        await this.doListCommand(helperInfo, request, response);
       } else {
-        await this.doRequest(helperName, pathParts[0], data, request, response);
+        await this.doNamedCommand(`docker-credential-${ helperInfo.credsStore }`, commandName, data, request, response);
       }
     } catch (err) {
       console.log(`Error handling ${ request.url }`, err);
@@ -115,7 +128,30 @@ export class HttpCredentialHelperServer {
     }
   }
 
-  protected async doRequest(
+  protected async runCommand(helperName: string,
+    commandName: string,
+    data: string): Promise<string> {
+    const platform = os.platform();
+    let pathVar = process.env.PATH ?? '';
+
+    // The PATH needs to contain our resources directory (on macOS that would
+    // not be in the application's PATH), as well as /usr/local/bin.
+    // NOTE: This needs to match DockerDirManager.
+    pathVar += path.delimiter + path.join(paths.resources, platform, 'bin');
+    if (platform === 'darwin') {
+      pathVar += `${ path.delimiter }/usr/local/bin`;
+    }
+
+    const body = stream.Readable.from(data);
+    const { stdout } = await childProcess.spawnFile(helperName, [commandName], {
+      env:   { ...process.env, PATH: pathVar },
+      stdio: [body, 'pipe', console]
+    });
+
+    return stdout;
+  }
+
+  protected async doNamedCommand(
     helperName: string,
     commandName: string,
     data: string,
@@ -124,22 +160,7 @@ export class HttpCredentialHelperServer {
     let stderr: string;
 
     try {
-      const platform = os.platform();
-      let pathVar = process.env.PATH ?? '';
-
-      // The PATH needs to contain our resources directory (on macOS that would
-      // not be in the application's PATH), as well as /usr/local/bin.
-      // NOTE: This needs to match DockerDirManager.
-      pathVar += path.delimiter + path.join(paths.resources, platform, 'bin');
-      if (platform === 'darwin') {
-        pathVar += `${ path.delimiter }/usr/local/bin`;
-      }
-
-      const body = stream.Readable.from(data);
-      const { stdout } = await childProcess.spawnFile(helperName, [commandName], {
-        env:   { ...process.env, PATH: pathVar },
-        stdio: [body, 'pipe', console]
-      });
+      const stdout = await this.runCommand(helperName, commandName, data);
 
       response.writeHead(200, { 'Content-Type': 'text/plain' });
       response.write(stdout);
@@ -152,22 +173,79 @@ export class HttpCredentialHelperServer {
   }
 
   /**
+   * For the LIST command, there are multiple possible sources of information that need to be merged into a simple
+   * { ServerURL: Username } hash.
+   * The first source is the credsStore.
+   * Then if any helper credsStores are identified in the `credHelpers` section, get the full { ServerURL: Username }
+   * from each of them, and keep only those ServerURLs that point to that credsStore.
+   */
+  protected async doListCommand(
+    thisHelperInfo: credHelperInfo,
+    request: http.IncomingMessage,
+    response: http.ServerResponse): Promise<void> {
+    try {
+      const serverAndUsernameInfo: Record<string, string> = JSON.parse(await this.runCommand(`docker-credential-${ thisHelperInfo.credsStore }`, 'list', ''));
+      const names = _.uniq(Object.values(thisHelperInfo.credHelpers));
+
+      for (const name of names) {
+        try {
+          const otherInfo = JSON.parse(await this.runCommand(`docker-credential-${ name }`, 'list', ''));
+
+          for (const [serverURL, username] of Object.entries(otherInfo)) {
+            if (thisHelperInfo.credHelpers[serverURL] === name) {
+              serverAndUsernameInfo[serverURL] = username as string;
+            }
+          }
+        } catch (err) {
+          console.debug(`Failed to get credential list for helper ${ name }`);
+        }
+      }
+      response.writeHead(200, { 'Content-Type': 'text/plain' });
+      response.write(JSON.stringify(serverAndUsernameInfo));
+
+      return;
+    } catch (err: any) {
+      const stderr = err.stderr || err.stdout || err.toString();
+
+      console.debug(`credentialServer: list: writing back status 400, error: ${ stderr }`);
+      response.writeHead(400, { 'Content-Type': 'text/plain' });
+      response.write(stderr);
+    }
+  }
+
+  /**
    * Returns the name of the credential-helper to use (which is a suffix of the helper `docker-credential-`).
    *
    * Note that callers are responsible for catching exceptions, which usually happens if the
    * `$HOME/docker/config.json` doesn't exist, its JSON is corrupt, or it doesn't have a `credsStore` field.
    */
-  protected async getCredentialHelperName(): Promise<string> {
+  protected async getCredentialHelperName(command: string, payload: string): Promise<credHelperInfo> {
     const home = findHomeDir();
     const dockerConfig = path.join(home ?? '', '.docker', 'config.json');
     const contents = JSON.parse((await fs.promises.readFile(dockerConfig, { encoding: 'utf-8' })).toString());
-    const credsStore = contents['credsStore'];
+    const credHelpers = contents.credHelpers;
+    const credsStore = contents.credsStore;
 
-    if (!credsStore) {
-      throw new Error(`No credsStore field in ${ dockerConfig }`);
+    if (credHelpers) {
+      let entry = '';
+
+      switch (command) {
+      case 'erase':
+      case 'get':
+        entry = credHelpers[payload.trim()];
+        break;
+      case 'store': {
+        const obj = JSON.parse(payload);
+
+        entry = obj.ServerURL ? credHelpers[obj.ServerURL] : '';
+      }
+      }
+      if (entry) {
+        return { credsStore: entry, credHelpers: { } };
+      }
     }
 
-    return credsStore;
+    return { credsStore, credHelpers };
   }
 
   closeServer() {
