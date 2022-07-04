@@ -237,7 +237,6 @@ describeWithCreds('Credentials server', () => {
     await expect(navPage.progressBar).toBeHidden();
   });
 
-
   test('it should complain about an unrecognized command', async() => {
     const badCommand = 'gazornaanplatt';
     const stdout = await doRequest(badCommand);
